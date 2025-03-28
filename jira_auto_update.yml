@@ -1,0 +1,227 @@
+name: Integracion Jira actualizacion de campos requeridos
+
+on:
+  pull_request:
+    branches:
+      - "release/*"
+    types:
+      - closed
+
+jobs:
+  update_jira:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📝 Extraer información básica del PR
+        id: extract_pr_data
+        run: |
+          echo "📌 Extrayendo información del PR..."
+
+          PR_BODY="${{ github.event.pull_request.body }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+
+          JIRA_TICKET=$(echo "$PR_BODY" | grep -o 'https://maxims.atlassian.net/browse/[^ ]*' | head -n 1 | awk -F'/' '{print $NF}')
+          echo "JIRA_TICKET=$JIRA_TICKET" >> $GITHUB_ENV
+
+          MERGED_BY="${{ github.actor }}"
+          echo "MERGED_BY=$MERGED_BY" >> $GITHUB_ENV
+          echo "PR_URL=$PR_URL" >> $GITHUB_ENV
+
+          if [[ -z "$JIRA_TICKET" ]]; then
+            echo "🚨 No se encontró un ticket de Jira en la descripción del PR. Abortando actualización."
+            echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
+          fi
+
+      - name: 🔍 Verificar si Jira ya tiene datos en los campos
+        id: check_jira_fields
+        if: env.SKIP_JIRA_UPDATE != 'true'
+        run: |
+          JIRA_RESPONSE=$(curl -s -u "it.dev.agent@maxillc.com:${{ secrets.JIRA_IT_DEV_AGENT }}" \
+            -X GET "https://maxims.atlassian.net/rest/api/2/issue/${{ env.JIRA_TICKET }}" \
+            -H "Content-Type: application/json")
+
+          FIELD_QUE_SE_HIZO=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10211 // empty')
+          FIELD_OBJETOS_AFECTADOS=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10212 // empty')
+
+          if [[ -n "$FIELD_QUE_SE_HIZO" && "$FIELD_QUE_SE_HIZO" != "empty" ]] && [[ -n "$FIELD_OBJETOS_AFECTADOS" && "$FIELD_OBJETOS_AFECTADOS" != "empty" ]]; then
+            echo "✅ Los campos ya contienen información. No se actualizarán."
+            echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
+          else
+            echo "SKIP_JIRA_UPDATE=false" >> $GITHUB_ENV
+          fi
+
+      - name: 📥 Extraer detalles completos del PR
+        id: extract_pr_details
+        run: |
+          echo "📥 Extrayendo detalles completos del PR..."
+
+          PR_BODY="${{ github.event.pull_request.body }}"
+
+          # Normalizar el cuerpo del PR para buscar secciones ignorando tildes y mayúsculas
+          PR_BODY_NORM=$(echo "$PR_BODY" | iconv -f utf8 -t ascii//TRANSLIT | tr '[:upper:]' '[:lower:]')
+
+          # Detectar líneas clave
+          START_QUE_SE_HIZO=$(echo "$PR_BODY_NORM" | grep -n -E '^que se hizo:' | cut -d: -f1)
+          START_OBJETOS=$(echo "$PR_BODY_NORM" | grep -n -E '^objetos (db|modificados):' | cut -d: -f1)
+          START_ETIQUETA=$(echo "$PR_BODY_NORM" | grep -n -E '^etiqueta relacionada:' | cut -d: -f1)
+
+          # Validar que las secciones existan antes de continuar
+          if [[ -z "$START_QUE_SE_HIZO" || -z "$START_OBJETOS" || -z "$START_ETIQUETA" ]]; then
+            echo "❌ No se encontraron las secciones requeridas en el PR. Abortando."
+            echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Extraer bloques de texto relevantes
+          WHAT_WAS_DONE=$(echo "$PR_BODY" | sed -n "$((START_QUE_SE_HIZO+1)),$((START_OBJETOS-1))p" | tr '\n' ' ' | sed 's/  */ /g')
+          OBJECTS_AFFECTED=$(echo "$PR_BODY" | sed -n "$((START_OBJETOS+1)),$((START_ETIQUETA-1))p" | tr '\n' ' ' | sed 's/  */ /g')
+
+          echo "WHAT_WAS_DONE=$WHAT_WAS_DONE" >> $GITHUB_ENV
+          echo "OBJECTS_AFFECTED=$OBJECTS_AFFECTED" >> $GITHUB_ENV
+
+          # Obtener archivos modificados del PR
+          CHANGED_FILES_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "${{ github.event.pull_request.url }}/files")
+
+          CHANGED_FILES=$(echo "$CHANGED_FILES_JSON" | jq -r '.[].filename' | tr '\n' ', ')
+          echo "CHANGED_FILES=$CHANGED_FILES" >> $GITHUB_ENV
+
+          DIFFS=$(echo "$CHANGED_FILES_JSON" | jq -r '.[].patch' | grep -E '^\+|^\-' | grep -vE '^\+\+\+|^\-\-\-' | head -c 3000)
+          if [[ -z "$DIFFS" ]]; then
+            DIFFS="No hay cambios significativos en el código."
+          fi
+
+          ESCAPED_WHAT_WAS_DONE=$(echo "$WHAT_WAS_DONE" | jq -c --slurp --raw-input .)
+          ESCAPED_OBJECTS_AFFECTED=$(echo "$OBJECTS_AFFECTED" | jq -c --slurp --raw-input .)
+          ESCAPED_CHANGED_FILES=$(echo "$CHANGED_FILES" | jq -c --slurp --raw-input .)
+          ESCAPED_DIFFS=$(echo "$DIFFS" | jq -c --slurp --raw-input .)
+
+          echo "ESCAPED_WHAT_WAS_DONE=$ESCAPED_WHAT_WAS_DONE" >> $GITHUB_ENV
+          echo "ESCAPED_OBJECTS_AFFECTED=$ESCAPED_OBJECTS_AFFECTED" >> $GITHUB_ENV
+          echo "ESCAPED_CHANGED_FILES=$ESCAPED_CHANGED_FILES" >> $GITHUB_ENV
+          echo "ESCAPED_DIFFS=$ESCAPED_DIFFS" >> $GITHUB_ENV
+
+      - name: 🤖 Generar resumen en español con Gemini
+        id: generate_summary_es
+        run: |
+          GEMINI_ENDPOINT="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+          PAYLOAD_ES=$(jq -c --null-input \
+            --arg what "$ESCAPED_WHAT_WAS_DONE" \
+            --arg objects "$ESCAPED_OBJECTS_AFFECTED" \
+            --arg files "$ESCAPED_CHANGED_FILES" \
+            --arg diffs "$ESCAPED_DIFFS" \
+            '{
+              "contents": [{
+                "role": "user",
+                "parts": [{
+                  "text": ("Eres un asistente especializado en resumir cambios de software en español, de forma clara, breve y no técnica. Máximo 3 líneas.\n\n" +
+                           "- Qué se hizo: " + $what + "\n" +
+                           "- Objetos afectados: " + $objects + "\n" +
+                           "- Archivos modificados: " + $files + "\n" +
+                           "- Cambios clave:\n" + $diffs)
+                }]
+              }]
+            }')
+
+          RESPONSE_ES=$(curl -s -X POST "$GEMINI_ENDPOINT?key=${{ secrets.GENINI_IT_DEV_AGENT }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD_ES")
+
+          SUMMARY_ES=$(echo "$RESPONSE_ES" | jq -r '.candidates[0].content.parts[0].text')
+
+          if [[ -z "$SUMMARY_ES" || "$SUMMARY_ES" == "null" ]]; then
+            SUMMARY_ES="No se pudo generar un resumen válido en español."
+          fi
+
+          # ✅ Limpiar para que pueda escribirse en $GITHUB_ENV
+          SUMMARY_ES_CLEAN=$(echo "$SUMMARY_ES" | tr '\n' ' ' | tr -d '\r' | tr -d '"')
+
+          echo "SUMMARY_ES=$SUMMARY_ES_CLEAN" >> $GITHUB_ENV
+
+      - name: 🌍 Generar resumen en inglés con Gemini
+        id: generate_summary_en
+        run: |
+          GEMINI_ENDPOINT="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+          PAYLOAD_EN=$(jq -c --null-input \
+            --arg what "$ESCAPED_WHAT_WAS_DONE" \
+            --arg objects "$ESCAPED_OBJECTS_AFFECTED" \
+            --arg files "$ESCAPED_CHANGED_FILES" \
+            --arg diffs "$ESCAPED_DIFFS" \
+            '{
+              "contents": [{
+                "role": "user",
+                "parts": [{
+                  "text": ("You are a software assistant. Summarize this change in clear, concise, and non-technical English, focused on business value or user benefit. Max 3 lines.\n\n" +
+                           "- What was done: " + $what + "\n" +
+                           "- Affected objects: " + $objects + "\n" +
+                           "- Changed files: " + $files + "\n" +
+                           "- Key code changes:\n" + $diffs)
+                }]
+              }]
+            }')
+
+          RESPONSE_EN=$(curl -s -X POST "$GEMINI_ENDPOINT?key=${{ secrets.GENINI_IT_DEV_AGENT }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD_EN")
+
+          SUMMARY_EN=$(echo "$RESPONSE_EN" | jq -r '.candidates[0].content.parts[0].text')
+
+          if [[ -z "$SUMMARY_EN" || "$SUMMARY_EN" == "null" ]]; then
+            SUMMARY_EN="No English summary generated."
+          fi
+
+          # ✅ Limpiar para que pueda escribirse en $GITHUB_ENV
+          SUMMARY_EN_CLEAN=$(echo "$SUMMARY_EN" | tr '\n' ' ' | tr -d '\r' | tr -d '"')
+
+          echo "SUMMARY_EN=$SUMMARY_EN_CLEAN" >> $GITHUB_ENV
+
+      - name: 📝 Actualizar campos en Jira (si están vacíos)
+        if: env.SKIP_JIRA_UPDATE == 'false'
+        run: |
+          curl -X PUT "https://maxims.atlassian.net/rest/api/2/issue/${{ env.JIRA_TICKET }}" \
+            -u "it.dev.agent@maxillc.com:${{ secrets.JIRA_IT_DEV_AGENT }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "fields": {
+                "customfield_10211": "${{ env.WHAT_WAS_DONE }}",
+                "customfield_10212": "${{ env.OBJECTS_AFFECTED }}"
+              }
+            }'
+
+      - name: 🗒️ Agregar comentario en Jira con resumen en español
+        if: env.JIRA_TICKET != ''
+        run: |
+          BODY_ES=$(echo "${{ env.SUMMARY_ES }}" | sed ':a;N;$!ba;s/\n/\\n/g' | tr -d '"' | tr -d '\\')
+          AUTHOR=$(echo "${{ env.MERGED_BY }}" | tr -d '"' | tr -d '\\')
+          PR_LINK=$(echo "${{ env.PR_URL }}" | tr -d '"' | tr -d '\\')
+
+          COMMENT_ES=$(printf "✅ *Este ticket fue actualizado automáticamente por* **%s** vía GitHub Actions.\\n\\n🔹 **Resumen en Español:**\\n%s\\n\\n🔗 [Pull Request](%s)" \
+            "$AUTHOR" "$BODY_ES" "$PR_LINK")
+
+          PAYLOAD_ES=$(jq -c --null-input --arg body "$COMMENT_ES" '{ "body": $body }')
+
+          curl -s -X POST "https://maxims.atlassian.net/rest/api/2/issue/${{ env.JIRA_TICKET }}/comment" \
+            -u "it.dev.agent@maxillc.com:${{ secrets.JIRA_IT_DEV_AGENT }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD_ES"
+
+      - name: 🗒️ Agregar comentario en Jira con resumen en inglés
+        if: env.JIRA_TICKET != ''
+        run: |
+          BODY_EN=$(echo "${{ env.SUMMARY_EN }}" | sed ':a;N;$!ba;s/\n/\\n/g' | tr -d '"' | tr -d '\\')
+          AUTHOR=$(echo "${{ env.MERGED_BY }}" | tr -d '"' | tr -d '\\')
+          PR_LINK=$(echo "${{ env.PR_URL }}" | tr -d '"' | tr -d '\\')
+
+          COMMENT_EN=$(printf "✅ *This ticket was auto-commented by* **%s** via GitHub Actions.\\n\\n**Summary in English:**\\n%s\\n\\n🔗 [View Pull Request](%s)" \
+            "$AUTHOR" "$BODY_EN" "$PR_LINK")
+
+          PAYLOAD_EN=$(jq -c --null-input --arg body "$COMMENT_EN" '{ "body": $body }')
+
+          curl -s -X POST "https://maxims.atlassian.net/rest/api/2/issue/${{ env.JIRA_TICKET }}/comment" \
+            -u "it.dev.agent@maxillc.com:${{ secrets.JIRA_IT_DEV_AGENT }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD_EN"
