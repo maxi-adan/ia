@@ -38,17 +38,41 @@ jobs:
         id: check_jira_fields
         if: env.SKIP_JIRA_UPDATE != 'true'
         run: |
+          echo "🔍 Verificando campos en Jira..."
+          
+          # Realizar la llamada a la API de Jira
           JIRA_RESPONSE=$(curl -s -u "it.dev.agent@maxillc.com:${{ secrets.JIRA_IT_DEV_AGENT }}" \
             -X GET "https://maxims.atlassian.net/rest/api/2/issue/${{ env.JIRA_TICKET }}" \
             -H "Content-Type: application/json")
 
-          FIELD_QUE_SE_HIZO=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10211 // empty')
-          FIELD_OBJETOS_AFECTADOS=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10212 // empty')
+          # Verificar si la llamada fue exitosa
+          if [[ $? -ne 0 ]]; then
+            echo "❌ Error al obtener datos de Jira"
+            echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
+            exit 0
+          fi
 
+          # Verificar si la respuesta es válida
+          if [[ -z "$JIRA_RESPONSE" ]]; then
+            echo "❌ No se recibió respuesta de Jira"
+            echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Extraer campos usando jq con manejo de errores
+          FIELD_QUE_SE_HIZO=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10211 // empty' 2>/dev/null || echo "empty")
+          FIELD_OBJETOS_AFECTADOS=$(echo "$JIRA_RESPONSE" | jq -r '.fields.customfield_10212 // empty' 2>/dev/null || echo "empty")
+
+          echo "📊 Estado de los campos:"
+          echo "Que se hizo: $FIELD_QUE_SE_HIZO"
+          echo "Objetos afectados: $FIELD_OBJETOS_AFECTADOS"
+
+          # Verificar si los campos tienen contenido válido
           if [[ -n "$FIELD_QUE_SE_HIZO" && "$FIELD_QUE_SE_HIZO" != "empty" ]] && [[ -n "$FIELD_OBJETOS_AFECTADOS" && "$FIELD_OBJETOS_AFECTADOS" != "empty" ]]; then
             echo "✅ Los campos ya contienen información. No se actualizarán."
             echo "SKIP_JIRA_UPDATE=true" >> $GITHUB_ENV
           else
+            echo "ℹ️ Los campos están vacíos o incompletos. Se procederá con la actualización."
             echo "SKIP_JIRA_UPDATE=false" >> $GITHUB_ENV
           fi
 
